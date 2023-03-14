@@ -20,6 +20,16 @@ from past.builtins import xrange
 from monkeys.trees import get_tree_info, build_tree, crossover, mutate
 from monkeys.exceptions import UnsatisfiableType
 
+import gc
+from multiprocessing import cpu_count, set_start_method
+try:
+    set_start_method('spawn')
+except:
+    pass
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from progressbar import ProgressBar
+import os,sys
+
 
 class Optimizations(object):
     COVARIANT_PARSIMONY = object()  # Poli & McPhee 2008
@@ -32,13 +42,40 @@ DEFAULT_OPTIMIZATIONS = {
 }
 
 
-def tournament_select(trees, scoring_fn, selection_size, requires_population=False, optimizations=DEFAULT_OPTIMIZATIONS, random_parsimony_prob=0.33, score_callback=None):
+def parallel_eval(score_iml, data, tree_tree_str_dict, max_workers):
+    pop_scores = list()
+    pid_tree_dict = dict()
+
+
+    with ProcessPoolExecutor(max_workers=max_workers,) as executor:
+        plist = list()
+        pid = 0
+        for tree in list(tree_tree_str_dict.keys()):
+            pid += 1
+            pid_tree_dict[pid] = tree
+
+            task = executor.submit(score_iml, best_equation_str=str(tree), pid=pid, inputs=data)
+            plist.append(task)
+        for k in ProgressBar(max_values=len(plist),
+                             prefix='$$$$$$$$ generation evalutaion progress ',
+                             suffix='$$$$$$')(as_completed(plist)):
+            tree_str, score, pid = k.result()
+            print("tree: {} || {}".format(score, tree_str))
+            pop_scores.append((tree_str, score, pid))
+    return pid_tree_dict, pop_scores
+
+
+def tournament_select(pid_tree_dict, pop_scores, trees, scoring_fn, selection_size, requires_population=False, optimizations=DEFAULT_OPTIMIZATIONS, random_parsimony_prob=0.33, score_callback=None):
     """
     Perform tournament selection on population of trees, using the specified
     objective function for comparison, and conducting tournaments of the
     specified selection size.
     """
+
     _scoring_fn = scoring_fn(trees) if requires_population else scoring_fn
+    # print("scoring")
+    # sys.stdin.readline()
+
 
     avg_size = 0
     sizes = {}
@@ -52,14 +89,27 @@ def tournament_select(trees, scoring_fn, selection_size, requires_population=Fal
         avg_size = sum(itervalues(sizes)) / float(len(sizes))
     
     if using_random_parsimony:
-        scores = collections.defaultdict(lambda: -sys.maxsize)
-        scores.update({
-            tree: _scoring_fn(tree)
+        # scores = collections.defaultdict(lambda: -sys.maxsize)
+        scores_str = collections.defaultdict(lambda: '')
+        scores_str.update({
+            # tree: _scoring_fn(tree)
+            tree: str(tree)
             for tree in trees
             if sizes[tree] <= avg_size or random_parsimony_prob < random.random() 
         })
     else:
-        scores = {tree: _scoring_fn(tree) for tree in trees}
+        # scores = {tree: _scoring_fn(tree) for tree in trees}
+        scores_str = {tree: str(tree) for tree in trees}
+
+    # TODO: parallel eva ########
+    # pop_scores<list> : tree_str, score, pid
+    # pid_tree_dict<map<pid, tree> >
+    # pid_tree_dict, pop_scores = parallel_eval(data, scores_str)
+    all_scores = {pid_tree_dict[pop_score[2]]: pop_score[1] for pop_score in pop_scores}
+    scores = {k:all_scores[k] for k in scores_str.keys()}
+    # max_pop_tree_score = max(pop_spcores, key=lambda x: x[1])
+    # new_pop = [pid_tree_dict[max_po_tree_score[2]]]
+
 
     if using_covariant_parsimony:
         covariance_matrix = numpy.cov(numpy.array([(sizes[tree], scores[tree]) for tree in trees]).T)
@@ -69,6 +119,8 @@ def tournament_select(trees, scoring_fn, selection_size, requires_population=Fal
 
     if using_pseudo_pareto:
         non_neg_inf_scores = [s for s in itervalues(scores) if s != -sys.maxsize]
+        print('non_neg_inf_scores = [s for s in itervalues(scores) if s != -sys.maxsize]')
+        # sys.stdin.readline()
         try:
             avg_score = sum(non_neg_inf_scores) / float(len(non_neg_inf_scores))
         except ZeroDivisionError:
@@ -81,6 +133,8 @@ def tournament_select(trees, scoring_fn, selection_size, requires_population=Fal
     if callable(score_callback):
         score_callback(scores)
 
+    gc.collect()
+
     while True:
         tree = max(
             random.sample(trees, selection_size),
@@ -88,15 +142,20 @@ def tournament_select(trees, scoring_fn, selection_size, requires_population=Fal
         )
         if scores.get(tree, -sys.maxsize) == -sys.maxsize:
             try:
+                print('-sys.maxsize: build_tree')
                 new_tree = build_tree_to_requirements(scoring_fn)
             except UnsatisfiableType:
                 continue
         else:
             try:
-                with recursion_limit(1500):
+                with recursion_limit(1000):
+                    # print('deepcopy a tree')
+                    # sys.stdin.readline()
                     new_tree = copy.deepcopy(tree)
+                    # sys.stdin.readline()
             except RuntimeError:
                 try:
+                    print('RuntimeError: build_tree')
                     new_tree = build_tree_to_requirements(scoring_fn)
                 except UnsatisfiableType:
                     continue
@@ -237,8 +296,8 @@ def build_tree_to_requirements(scoring_function, build_tree=build_tree):
         raise ValueError("Scoring function must accept a single parameter.")
     return_type, = params
 
-    for __ in xrange(9999):
-        with recursion_limit(500):
+    for __ in xrange(99999):
+        with recursion_limit(1000):
             tree = build_tree(return_type, convert=False)
         requirements = getattr(scoring_function, 'required_inputs', ())
         if not all(req in tree for req in requirements):
@@ -248,38 +307,91 @@ def build_tree_to_requirements(scoring_function, build_tree=build_tree):
     raise UnsatisfiableType("Could not meet input requirements.")
 
 
-def next_generation(
+def next_generation(data,
         trees, scoring_fn,
         select_fn=DEFAULT_TOURNAMENT_SELECT,
         build_tree=build_tree_to_requirements, mutate=mutate,
-        crossover_rate=0.80, mutation_rate=0.01,
+        crossover_rate=0.75, mutation_rate=0.15,
         score_callback=None,
-        optimizations=DEFAULT_OPTIMIZATIONS
+        optimizations=DEFAULT_OPTIMIZATIONS,
+        scoring_fn_iml=None,
+        max_workers=round(cpu_count() - 4)
     ):
     """
     Create next generation of trees from prior generation, maintaining current
     size.
     """
-    selector = select_fn(trees, scoring_fn, score_callback=score_callback, optimizations=optimizations)
+
+    # print('start next gene')
+    # import time
+    # sys.stdin.readline()
+    # selector = select_fn(data, trees, scoring_fn, score_callback=score_callback, optimizations=optimizations)
+    # print('finish next gene')
+    # import time
+    # sys.stdin.readline()
+
     pop_size = len(trees)
-    
-    new_pop = [max(trees, key=scoring_fn)]
+    # tree_strs_dict = {scoring_fn(tree):tree for tree in trees}
+    pid_tree_dict, pop_scores = parallel_eval(scoring_fn_iml, data,
+                                              {tree: str(tree) for tree in trees },
+                                              max_workers=max_workers)
+    max_pop_tree_scores = sorted(pop_scores, key=lambda x:x[1])
+    max_pop_tree_score = max_pop_tree_scores[-1]
+    with open('best_eq', 'a') as h:
+        # log top5 scores trees
+        for sc in max_pop_tree_scores[-5:]:
+            h.write('{} || {}\n'.format(sc[1], sc[0]))
+
+    new_pop = [pid_tree_dict[max_pop_tree_score[2]]]
+
+    selector = select_fn(pid_tree_dict, pop_scores, trees, scoring_fn, score_callback=score_callback, optimizations=optimizations)
+
+    # new_pop = [max(trees, key=scoring_fn)]
     for __ in xrange(pop_size - 1):
+
+        gc.collect()
+        print("start build next pop {}".format(__))
+        # sys.stdin.readline()
+
         if random.random() <= crossover_rate:
             for __ in xrange(99999):
                 try:
-                    new_pop.append(crossover(next(selector), next(selector)))
+                    p1 = next(selector)
+                    # print("p1 next")
+                    # sys.stdin.readline()
+                    p2 = next(selector)
+                    # print("p2 next")
+                    # sys.stdin.readline()
+                    # new_pop.append(crossover(next(selector), next(selector)))
+                    cp = crossover(p1, p2)
+                    # print("crossover ")
+
+                    # sys.stdin.readline()
+                    new_pop.append(cp)
+                    # print("append crossover")
+
+                    # sys.stdin.readline()
+                    print("new_pop.append(crossover(next(selector), next(selector)))  SATISFIED!!!!")
                     break
                 except (UnsatisfiableType, RuntimeError):
                     continue
             else:
+
                 new_pop.append(build_tree(scoring_fn))
+                print(" new_pop.append(build_tree(scoring_fn))")
+                # sys.stdin.readline()
 
         elif random.random() <= mutation_rate / (1 - crossover_rate):
+
             new_pop.append(mutate(next(selector)))
+            print("new_pop.append(mutate(next(selector)))")
+            # sys.stdin.readline()
 
         else:
+
             new_pop.append(next(selector))
+            print("new_pop.append(next(selector))")
+            # sys.stdin.readline()
 
     return new_pop
 
@@ -306,14 +418,16 @@ def recursion_limit(limit):
         sys.setrecursionlimit(orig_limit)
     
 
-def optimize(
-        scoring_function,
-        population_size=250,
-        iterations=25,
-        build_tree=build_tree,
-        next_generation=next_generation,
-        show_scores=True,
-        optimizations=DEFAULT_OPTIMIZATIONS
+def optimize(data,
+            scoring_function,
+            population_size=250,
+            iterations=25,
+            build_tree=build_tree,
+            next_generation=next_generation,
+            show_scores=True,
+            optimizations=DEFAULT_OPTIMIZATIONS,
+            scoring_fn_iml=None,
+            max_workers=round(cpu_count() - 4)
     ):
     print("Creating initial population of {}.".format(population_size))
     sys.stdout.flush()
@@ -366,19 +480,40 @@ def optimize(
             early_stop.append(True)
     
     print("Optimizing...")
-    with recursion_limit(600):
+    with recursion_limit(1000):
         for iteration in xrange(iterations):
+            with open('{}-iterations.log'.format(os.getpid()),'a') as h:
+                h.write('********** iteration {}\n'.format(iteration))
+
             callback = functools.partial(score_callback, iteration)
-            population = next_generation(
+            tmp_population = next_generation(data,
                 population,
                 scoring_function,
                 build_tree=build_to_requirements,
                 mutate=mutate,
                 score_callback=callback,
                 optimizations=optimizations,
+                scoring_fn_iml=scoring_fn_iml,
+                max_workers=max_workers,
             )
+            population = tmp_population
+
+            del tmp_population
+            import gc
+            gc.collect()
+
             if early_stop:
                 break
-        
-    best_tree = max(best_tree, key=scoring_function)
-    return best_tree
+
+    pid_tree_dict, pop_scores = parallel_eval(scoring_fn_iml, data,
+                                              {tree: str(tree) for tree in best_tree},
+                                              max_workers=max_workers)
+    max_pop_tree_scores = sorted(pop_scores, key=lambda x: x[1])
+    max_pop_tree_score = max_pop_tree_scores[-1]
+    with open('best_eq', 'a') as h:
+        for sc in max_pop_tree_scores:
+            h.write('{} || {}\n'.format(sc[1], sc[0]))
+
+    # best_tree_max = max(best_tree, key=scoring_function)
+    best_tree_max = pid_tree_dict[max_pop_tree_score[2]]
+    return best_tree_max
